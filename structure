@@ -1,0 +1,7 @@
+email_triage_env/
+├── openenv.yaml               # OpenEnv metadata
+├── environment.py             # EmailTriageEnv class
+├── inference.py               # Baseline inference script
+├── Dockerfile                 # Container configuration
+├── requirements.txt           # Python dependencies
+└── README.md                  # Project documentation

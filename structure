@@ -1,7 +1,347 @@
-email_triage_env/
-├── openenv.yaml               # OpenEnv metadata
-├── environment.py             # EmailTriageEnv class
-├── inference.py               # Baseline inference script
-├── Dockerfile                 # Container configuration
-├── requirements.txt           # Python dependencies
-└── README.md                  # Project documentation
+name: email-triage-env
+description: Email triage environment with three tasks: spam detection, priority classification, and response drafting.
+version: 1.0.0
+environment: environment.EmailTriageEnv
+models:
+  observation: environment.EmailObservation
+  action: environment.EmailAction
+  reward: float
+import random
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
+from openenv import OpenEnv  # This is the expected base class, but we'll just implement the interface
+
+# ----------------------------------------------------------------------
+# Pydantic models for OpenEnv
+# ----------------------------------------------------------------------
+class EmailObservation(BaseModel):
+    task_id: int = Field(description="0=spam detection, 1=priority, 2=response")
+    subject: str = Field(description="Email subject")
+    body: str = Field(description="Email body")
+    task_description: str = Field(description="What the agent must do")
+
+class EmailAction(BaseModel):
+    spam_label: Optional[bool] = Field(default=None, description="For task0: True=spam, False=ham")
+    priority: Optional[str] = Field(default=None, description="For task1: 'high', 'medium', 'low'")
+    response: Optional[str] = Field(default=None, description="For task2: draft email reply")
+
+# ----------------------------------------------------------------------
+# Email Triage Environment
+# ----------------------------------------------------------------------
+class EmailTriageEnv:
+    """
+    Implements the OpenEnv interface:
+    - reset(task_id, email_index) -> EmailObservation
+    - step(action) -> (observation, reward, done, info)
+    - state() -> dict (internal state)
+    """
+
+    def __init__(self):
+        # Predefined emails for each task
+        self._emails = {
+            0: [  # spam detection
+                {"subject": "Win a free iPhone!", "body": "Click here to claim your prize...", "spam": True},
+                {"subject": "Meeting tomorrow", "body": "Let's discuss the project at 10am.", "spam": False},
+                {"subject": "URGENT: Your account will be closed", "body": "Verify your details now or lose access.", "spam": True},
+                {"subject": "Weekly report", "body": "Please find attached the weekly numbers.", "spam": False},
+                {"subject": "Congratulations! You won $1000", "body": "Send your bank details to claim.", "spam": True},
+            ],
+            1: [  # priority classification
+                {"subject": "Critical system failure", "body": "The production server is down.", "priority": "high"},
+                {"subject": "Team lunch next week", "body": "Let's decide a place for lunch.", "priority": "low"},
+                {"subject": "Urgent: Client deadline moved up", "body": "We need to deliver by Friday.", "priority": "high"},
+                {"subject": "Reminder: timesheet submission", "body": "Please submit your hours by EOD.", "priority": "medium"},
+                {"subject": "New feature proposal", "body": "Idea for improving the dashboard.", "priority": "medium"},
+            ],
+            2: [  # response drafting
+                {
+                    "subject": "Request for quote",
+                    "body": "Can you provide a quote for 10 units? Need it by tomorrow.",
+                    "expected_keywords": ["quote", "10 units", "tomorrow"],
+                    "polite_phrases": ["please", "thank", "appreciate"]
+                },
+                {
+                    "subject": "Meeting reschedule",
+                    "body": "I can't make it at 2pm. Can we move to 4pm?",
+                    "expected_keywords": ["reschedule", "4pm", "2pm"],
+                    "polite_phrases": ["sorry", "apologize", "thanks"]
+                },
+                {
+                    "subject": "Bug report",
+                    "body": "The login button doesn't work. Please fix.",
+                    "expected_keywords": ["login", "button", "fix"],
+                    "polite_phrases": ["please", "thanks"]
+                },
+                {
+                    "subject": "Vacation request",
+                    "body": "I would like to take next week off.",
+                    "expected_keywords": ["vacation", "next week", "approve"],
+                    "polite_phrases": ["please", "thank you"]
+                },
+                {
+                    "subject": "Invoice inquiry",
+                    "body": "When will invoice #123 be paid?",
+                    "expected_keywords": ["invoice", "#123", "paid"],
+                    "polite_phrases": ["please", "thank"]
+                },
+            ]
+        }
+        self._current_task = None
+        self._current_email = None
+        self._done = False
+        self._email_index = None  # for state() tracking
+
+    def reset(self, task_id: int = 0, email_index: int = 0) -> EmailObservation:
+        """
+        Reset environment to a specific task and email.
+        """
+        if task_id not in self._emails:
+            raise ValueError(f"Invalid task_id: {task_id}. Must be 0,1,2")
+        self._current_task = task_id
+        self._email_index = email_index % len(self._emails[task_id])
+        self._current_email = self._emails[task_id][self._email_index]
+        self._done = False
+        return self._get_observation()
+
+    def step(self, action: EmailAction) -> tuple[EmailObservation, float, bool, dict]:
+        """
+        Process the action and return next observation, reward, done, info.
+        """
+        if self._done:
+            raise RuntimeError("Episode already done. Call reset() first.")
+
+        reward = 0.0
+        info = {}
+
+        if self._current_task == 0:
+            # Spam detection
+            if action.spam_label is None:
+                reward = 0.0
+                info["error"] = "Missing spam_label"
+            else:
+                correct = (action.spam_label == self._current_email["spam"])
+                reward = 1.0 if correct else 0.0
+                info["correct"] = correct
+
+        elif self._current_task == 1:
+            # Priority classification
+            if action.priority is None:
+                reward = 0.0
+                info["error"] = "Missing priority"
+            else:
+                correct_priority = self._current_email["priority"]
+                if action.priority == correct_priority:
+                    reward = 1.0
+                elif (correct_priority == "high" and action.priority == "medium") or \
+                     (correct_priority == "medium" and action.priority in ("high","low")):
+                    reward = 0.5
+                elif (correct_priority == "low" and action.priority == "medium"):
+                    reward = 0.5
+                else:
+                    reward = 0.0
+                info["correct"] = (action.priority == correct_priority)
+
+        elif self._current_task == 2:
+            # Response drafting
+            if action.response is None:
+                reward = 0.0
+                info["error"] = "Missing response"
+            else:
+                resp_lower = action.response.lower()
+                expected = self._current_email["expected_keywords"]
+                polite = self._current_email["polite_phrases"]
+
+                # Keyword matching
+                matched = sum(1 for kw in expected if kw in resp_lower)
+                keyword_score = matched / len(expected) if expected else 1.0
+
+                # Politeness check
+                polite_score = sum(1 for phrase in polite if phrase in resp_lower) / len(polite) if polite else 1.0
+
+                # Weighted score
+                reward = 0.7 * keyword_score + 0.3 * polite_score
+                info["keyword_match"] = matched
+                info["politeness_score"] = polite_score
+
+        self._done = True  # All tasks are single‑step
+        return self._get_observation(), reward, self._done, info
+
+    def state(self) -> dict:
+        """Return current internal state."""
+        return {
+            "task_id": self._current_task,
+            "email_index": self._email_index,
+            "done": self._done,
+        }
+
+    def _get_observation(self) -> EmailObservation:
+        """Build the current observation."""
+        desc = ""
+        if self._current_task == 0:
+            desc = "Classify the email as spam (True) or not spam (False)."
+        elif self._current_task == 1:
+            desc = "Assign priority: 'high', 'medium', or 'low'."
+        elif self._current_task == 2:
+            desc = "Draft a polite, professional response that addresses the key points."
+
+        return EmailObservation(
+            task_id=self._current_task,
+            subject=self._current_email["subject"],
+            body=self._current_email["body"],
+            task_description=desc,
+        )
+import os
+import sys
+from openai import OpenAI
+from environment import EmailTriageEnv, EmailAction
+
+# ----------------------------------------------------------------------
+# Read required environment variables
+# ----------------------------------------------------------------------
+API_BASE_URL = os.environ.get("API_BASE_URL")
+MODEL_NAME = os.environ.get("MODEL_NAME")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+if not all([API_BASE_URL, MODEL_NAME, HF_TOKEN]):
+    print("ERROR: Missing one or more required environment variables:")
+    print("  API_BASE_URL, MODEL_NAME, HF_TOKEN")
+    sys.exit(1)
+
+# ----------------------------------------------------------------------
+# Initialize OpenAI client with custom base URL and token
+# ----------------------------------------------------------------------
+client = OpenAI(
+    base_url=API_BASE_URL,
+    api_key=HF_TOKEN,
+)
+
+# ----------------------------------------------------------------------
+# Prompt templates for each task
+# ----------------------------------------------------------------------
+def build_prompt(obs):
+    """Construct a prompt for the LLM based on the observation."""
+    task_desc = obs.task_description
+    subject = obs.subject
+    body = obs.body
+
+    if obs.task_id == 0:
+        return (
+            f"{task_desc}\n\n"
+            f"Subject: {subject}\n"
+            f"Body: {body}\n\n"
+            "Answer with only 'spam' or 'ham'."
+        )
+    elif obs.task_id == 1:
+        return (
+            f"{task_desc}\n\n"
+            f"Subject: {subject}\n"
+            f"Body: {body}\n\n"
+            "Answer with only 'high', 'medium', or 'low'."
+        )
+    elif obs.task_id == 2:
+        return (
+            f"{task_desc}\n\n"
+            f"Subject: {subject}\n"
+            f"Body: {body}\n\n"
+            "Write a short, professional email reply."
+        )
+    else:
+        raise ValueError(f"Unknown task_id: {obs.task_id}")
+
+def parse_action(obs, llm_response):
+    """Convert LLM response into an EmailAction object."""
+    if obs.task_id == 0:
+        resp = llm_response.strip().lower()
+        if resp in ["spam", "ham"]:
+            spam_label = (resp == "spam")
+            return EmailAction(spam_label=spam_label)
+        else:
+            # Default to ham if unclear
+            return EmailAction(spam_label=False)
+
+    elif obs.task_id == 1:
+        resp = llm_response.strip().lower()
+        if resp in ["high", "medium", "low"]:
+            return EmailAction(priority=resp)
+        else:
+            return EmailAction(priority="medium")  # fallback
+
+    elif obs.task_id == 2:
+        return EmailAction(response=llm_response.strip())
+
+    else:
+        return EmailAction()
+
+# ----------------------------------------------------------------------
+# Run evaluation for a single task
+# ----------------------------------------------------------------------
+def evaluate_task(env, task_id, num_emails):
+    total_reward = 0.0
+    for idx in range(num_emails):
+        obs = env.reset(task_id=task_id, email_index=idx)
+        prompt = build_prompt(obs)
+
+        # Call LLM
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=300,
+            )
+            llm_output = response.choices[0].message.content
+        except Exception as e:
+            print(f"LLM error for task {task_id}, email {idx}: {e}")
+            llm_output = ""
+
+        action = parse_action(obs, llm_output)
+        _, reward, _, info = env.step(action)
+        total_reward += reward
+        print(f"  Email {idx}: reward={reward:.2f}  info={info}")
+
+    avg_reward = total_reward / num_emails if num_emails > 0 else 0.0
+    return avg_reward
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    env = EmailTriageEnv()
+
+    # Number of emails per task (use all available)
+    num_emails = {
+        0: len(env._emails[0]),
+        1: len(env._emails[1]),
+        2: len(env._emails[2]),
+    }
+
+    print("Starting baseline evaluation...\n")
+    scores = {}
+    for task_id in [0, 1, 2]:
+        print(f"Evaluating Task {task_id}...")
+        scores[task_id] = evaluate_task(env, task_id, num_emails[task_id])
+        print(f"Task {task_id} average score: {scores[task_id]:.3f}\n")
+
+    overall = sum(scores.values()) / 3.0
+    print(f"Overall baseline score: {overall:.3f}")
+
+if __name__ == "__main__":
+    main()
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY environment.py .
+COPY inference.py .
+COPY openenv.yaml .
+
+# Command to run inference (can be overridden)
+CMD ["python", "inference.py"]
+openai>=1.0.0
+pydantic>=2.0.0
+openenv>=0.1.0

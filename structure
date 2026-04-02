@@ -1,11 +1,4 @@
-name: email-triage-env
-description: Email triage environment with three tasks: spam detection, priority classification, and response drafting.
-version: 1.0.0
-environment: environment.EmailTriageEnv
-models:
-  observation: environment.EmailObservation
-  action: environment.EmailAction
-  reward: float
+
 import random
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
